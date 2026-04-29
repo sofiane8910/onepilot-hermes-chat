@@ -35,7 +35,7 @@ logger = logging.getLogger("hermes_plugins.onepilot.wrapper")
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PLUGIN_DIR / "config.json"
-PLUGIN_VERSION = "0.3.0+wrapper"
+PLUGIN_VERSION = "0.6.0"
 
 
 def _load_config() -> dict[str, Any]:
