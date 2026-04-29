@@ -12,6 +12,31 @@ When a Hermes profile has the `onepilot` plugin enabled:
 
 The plugin runs inside the Hermes gateway's asyncio event loop. There is no separate process: when the gateway is up, the plugin is up; when the gateway crashes and restarts, so does the plugin.
 
+## Design principles
+
+These rules govern every change to this plugin. The app ships through App Store review (1–2 week turnaround) but the plugin ships through `plugin_manifest` (instant). When the boundary between them blurs, every framework rename or schema tweak becomes a stuck App Store release. Don't blur the boundary.
+
+**1. Plugins are the heavy lifters.** Anything that touches Hermes — `hermes` CLI flags, profile/config paths, plugin install, account write-back, cron-channel registration — lives **here**, not in iOS. If Hermes renames a flag or moves a private symbol (see `UPSTREAM.md`), this plugin absorbs it and ships v+1 via `plugin_manifest`. New iOS adapter code calling `hermes <verb>` directly is a regression — route it through the wrapper API in `wrapper_api.py` and let the plugin shell out internally.
+
+**2. The app renders what we control.** iOS speaks to two surfaces only: this plugin's `/onepilot/v1/*` HTTP wrapper and the chat WebSocket. Both shapes are owned by us, both are versioned, both have contract tests. UI gates on `AgentFrameworkCapability`, never on `frameworkType == .hermes`. New features land as new wrapper endpoints — not as new `hermes` invocations from Swift. If the app needs to render something the plugin doesn't expose yet, add the endpoint here first.
+
+**3. Security first.** A leaked agent key (`oak_*`) must read zero rows outside its bound `(user_id, agent_profile_id)`, and writes must be attributed only to that pair — server-side, not from request body. Every wrapper endpoint takes `Authorization: Bearer <agentKey>`, binds on `127.0.0.1` only, and never accepts user-supplied `userId`/`agentProfileId` overrides. New edge-function calls require a `SCOPE.md` documenting the authz scope. New imports (`subprocess`, `eval`, `exec`, dynamic `__import__`, write-mode `open` outside the plugin dir) need explicit justification — the in-process plugin model means anything we import has full gateway access. Monkey-patching framework internals (e.g. `cron.scheduler._deliver_result`) is a last resort; prefer a public API and file the upstream request in `UPSTREAM.md`. Residual risks are tracked in the parent repo's `SECURITY_AUDIT.md`.
+
+**4. This repo is public — write for strangers, not insiders.** The plugin source ships to GitHub and runs on every user's host. Treat every comment, log line, error string, and identifier as user-readable.
+
+- No backend architecture leaks: don't reference internal vendor names, project IDs, internal table names beyond what an endpoint already exposes, dashboard URLs, deploy hostnames, or service-internal tooling. Generic terms (`backend`, `auth provider`, `realtime channel`) over branded ones. (Vendor-name leaks are CI-gated — see `ci/plugin/hermes-platform/snapshot-diff.sh`.)
+- No verbose internal commentary. Comments explain **why** a non-obvious thing is the way it is, not what the code does. No multi-paragraph docstrings, no walls of context that only make sense to someone on the team. If a reader needs three paragraphs to understand a function, the code is wrong, not the comments.
+- No JIRA / Linear / PR / incident references in code. They rot, and they leak our process. Put that context in the commit message, where it belongs.
+- No hardcoded internal URLs or staging hostnames. All endpoints come from `config["backendUrl"]` / `config["streamUrl"]` at runtime.
+- Log lines are user-facing too — they end up in the gateway log and the user's terminal. No stack-trace dumps with internal paths, no PII, no full bearer tokens (prefix-only is fine for diagnostics).
+- Error messages exposed via the wrapper API are bounded (`[:200]`) for the same reason — bound the leak surface.
+
+**Practical contract:**
+
+- Bump `pyproject.toml` + `plugin.yaml` versions + refresh the bundled Swift snapshot (`HermesOnepilotPlugin.swift`) in the same PR.
+- New `/onepilot/v1/*` endpoint → contract test in `test/test_wrapper_api.py` + matching method in `OnepilotPluginClient.swift` in the app repo.
+- Bootstrap commands (the very first `hermes profile create`, first plugin write, first `gateway run`) are exempt — by definition the wrapper API doesn't exist yet.
+
 ## Layout
 
 ```
