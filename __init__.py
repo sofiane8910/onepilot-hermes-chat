@@ -380,6 +380,316 @@ async def _connect_and_subscribe(config: dict[str, Any]) -> None:
             renew_task.cancel()
 
 
+def _channel_for_session(session_id: str) -> str:
+    """Realtime channel name iOS subscribes to. Mirrors RealtimeMessageListener
+    in the iOS client: `messages_<first 8 chars of UUID, UPPERCASE>`. Swift's
+    `UUID.uuidString` is uppercase and Supabase Realtime topic matching is
+    case-sensitive, so lowercasing here would route every broadcast to a
+    topic nobody is listening on (postgres INSERTs still arrive via a
+    different code path, which is why the final reply lands but live
+    progress events disappeared)."""
+    s = str(session_id).replace("-", "").upper()
+    return f"messages_{s[:8]}"
+
+
+async def _broadcast(config: dict[str, Any], session_id: str, event: str, payload: dict[str, Any]) -> None:
+    """Best-effort fire-and-forget broadcast of a live progress event to the
+    iOS client via Supabase Realtime's HTTP broadcast API. Failures are
+    non-fatal: the canonical chat reply is still delivered through the
+    existing ingest path. Short timeout so a broken realtime endpoint
+    cannot stall the agent loop."""
+    import httpx
+    url = f"{config['backendUrl']}/realtime/v1/api/broadcast"
+    body = {
+        "messages": [
+            {
+                "topic": _channel_for_session(session_id),
+                "event": event,
+                "payload": payload,
+                "private": False,
+            }
+        ]
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": config["publishableKey"],
+        "Authorization": f"Bearer {config['publishableKey']}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(url, headers=headers, json=body)
+    except Exception as exc:
+        logger.debug("[onepilot] broadcast %s failed: %s", event, exc)
+
+
+async def _progress_upsert(
+    config: dict[str, Any],
+    session_id: str,
+    user_id: str,
+    agent_profile_id: str,
+    reasoning_text: str,
+) -> None:
+    """Persist the in-flight reasoning trail to `agent_session_progress` so
+    the iOS client can hydrate it on bootstrap if the user reopens a chat
+    mid-thought. Realtime broadcasts are fire-and-forget; this single live
+    row fills the disconnect-window gap. Best-effort: a 404 on the table
+    (migration not applied yet) is logged at debug and ignored — the chat
+    still works without it. Framework-agnostic: any agent plugin writes
+    the same shape."""
+    import httpx
+    url = f"{config['backendUrl']}/rest/v1/agent_session_progress"
+    body = {
+        "session_id": str(session_id).lower(),
+        "user_id": str(user_id).lower(),
+        "agent_profile_id": str(agent_profile_id).lower(),
+        "reasoning_text": reasoning_text,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": config["publishableKey"],
+        "Authorization": f"Bearer {config['publishableKey']}",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.post(url, headers=headers, json=body)
+            if r.status_code >= 400:
+                logger.debug("[onepilot] progress upsert %s: %s", r.status_code, r.text[:200])
+    except Exception as exc:
+        logger.debug("[onepilot] progress upsert failed: %s", exc)
+
+
+async def _progress_clear(config: dict[str, Any], session_id: str) -> None:
+    """Drop the live progress row. Called on `done` and on terminal errors so
+    the iOS hydrate path doesn't resurface a stale trail next time the chat
+    opens. Best-effort — a missing row is fine."""
+    import httpx
+    url = (
+        f"{config['backendUrl']}/rest/v1/agent_session_progress"
+        f"?session_id=eq.{str(session_id).lower()}"
+    )
+    headers = {
+        "apikey": config["publishableKey"],
+        "Authorization": f"Bearer {config['publishableKey']}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.delete(url, headers=headers)
+    except Exception as exc:
+        logger.debug("[onepilot] progress clear failed: %s", exc)
+
+
+async def _post_assistant_row(config: dict[str, Any], row: dict[str, Any], text: str, kind: str = "text") -> None:
+    """Post an assistant row via the canonical ingest path. Used both for
+    real replies and for surfacing plugin-level errors as visible chat
+    messages so the iOS client never sits on a silent timeout."""
+    import httpx
+    ingest_body = {
+        "userId": str(config["userId"]).lower(),
+        "agentProfileId": str(config["agentProfileId"]).lower(),
+        "sessionKey": row.get("session_key") or config["sessionKey"],
+        "role": "assistant",
+        "content": [{"type": kind, "text": text}],
+        "timestamp": int(time.time() * 1000),
+    }
+    ingest_url = f"{config['backendUrl']}/functions/v1/agent-message-ingest"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config['agentKey']}",
+    }
+    body_str = json.dumps(ingest_body)
+    delays = [0.25, 0.75]
+    for attempt in range(len(delays) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(ingest_url, headers=headers, content=body_str)
+            if r.status_code < 500 or attempt == len(delays):
+                if r.status_code != 200:
+                    logger.warning("[onepilot] ingest %d: %s", r.status_code, r.text[:200])
+                else:
+                    logger.info("[onepilot] %s delivered (%d chars)", kind, len(text))
+                return
+            logger.warning("[onepilot] ingest %d (attempt %d) — retrying", r.status_code, attempt + 1)
+        except Exception as exc:
+            if attempt == len(delays):
+                logger.warning("[onepilot] ingest network error: %s", exc)
+                return
+            logger.warning("[onepilot] ingest network error (attempt %d): %s — retrying", attempt + 1, exc)
+        await asyncio.sleep(delays[attempt])
+
+
+async def _stream_completion(
+    client: "httpx.AsyncClient",
+    completion_url: str,
+    headers: dict[str, str],
+    messages: list[dict[str, str]],
+    on_progress,
+) -> tuple[Optional[str], Optional[str]]:
+    """Stream /v1/chat/completions, fire `on_progress(event, payload)` for
+    each tool-progress event, accumulate text deltas, return
+    (reply_text, error). On HTTP/SSE error, returns (None, error_string).
+    The api_server emits OpenAI-shape SSE plus a custom
+    `event: hermes.tool.progress` frame whenever the agent calls a tool —
+    that's the live "is the agent thinking" signal we forward to iOS."""
+    accumulated: list[str] = []
+    pending_event: Optional[str] = None
+    pending_data_lines: list[str] = []
+    # <think>…</think> blocks streamed across multiple SSE chunks need
+    # boundary-aware extraction. We track whether we're inside a think block
+    # so a tag that splits across two deltas still gets captured as reasoning
+    # and stripped from the visible reply.
+    in_think_block = False
+    # Log every distinct delta-key shape we see in the stream so we can tell
+    # which field the model is actually using (reasoning_content vs reasoning
+    # vs reasoning_details vs <think> in content). One-shot-per-shape keeps
+    # the log volume bounded — the first chunk is usually just `['role']` and
+    # is uninformative; the interesting one is whichever shape carries the
+    # actual reasoning text in subsequent chunks.
+    seen_delta_shapes: set[tuple[str, ...]] = set()
+
+    async def _flush() -> None:
+        nonlocal pending_event, pending_data_lines
+        if not pending_data_lines:
+            pending_event = None
+            return
+        raw = "\n".join(pending_data_lines).strip()
+        pending_data_lines = []
+        evt = pending_event
+        pending_event = None
+        if not raw or raw == "[DONE]":
+            return
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return
+        if evt == "hermes.tool.progress":
+            try:
+                await on_progress("tool_progress", obj if isinstance(obj, dict) else {"raw": raw})
+            except Exception as exc:
+                logger.debug("[onepilot] on_progress raised: %s", exc)
+            return
+        # Standard chat-completion chunk. We accept reasoning under any of:
+        #   delta.reasoning_content   (DeepSeek-R1, GLM-thinking, Z.AI)
+        #   delta.reasoning           (some OpenRouter providers, MiniMax M2)
+        #   delta.reasoning_details[] (OpenRouter unified shape, items have .text / .content / .summary)
+        #   <think>…</think> inside delta.content (Anthropic-style, MiniMax)
+        # The think-tag path also strips the tags + their contents from the
+        # visible reply so the user only sees the final answer.
+        nonlocal in_think_block, seen_delta_shapes
+        try:
+            choices = obj.get("choices") or []
+            if not choices:
+                return
+            delta = (choices[0] or {}).get("delta") or {}
+            try:
+                shape = tuple(sorted(delta.keys()))
+                if shape and shape not in seen_delta_shapes:
+                    seen_delta_shapes.add(shape)
+                    sample = {k: type(delta[k]).__name__ for k in shape}
+                    logger.info("[onepilot] new delta shape keys=%s types=%s", list(shape), sample)
+            except Exception:
+                pass
+
+            async def _emit_reasoning(piece: str) -> None:
+                if not piece:
+                    return
+                try:
+                    await on_progress("reasoning_delta", {"text": piece})
+                except Exception:
+                    pass
+
+            # 1. Explicit reasoning fields (provider-emitted, never in content).
+            for field in ("reasoning_content", "reasoning"):
+                val = delta.get(field)
+                if isinstance(val, str) and val:
+                    await _emit_reasoning(val)
+
+            # 2. OpenRouter-style reasoning_details: list of dicts with text/content/summary.
+            details = delta.get("reasoning_details")
+            if isinstance(details, list):
+                for item in details:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("text", "content", "thinking"):
+                        v = item.get(key)
+                        if isinstance(v, str) and v:
+                            await _emit_reasoning(v)
+                    summary = item.get("summary")
+                    if isinstance(summary, list):
+                        for s in summary:
+                            if isinstance(s, dict):
+                                t = s.get("text")
+                                if isinstance(t, str) and t:
+                                    await _emit_reasoning(t)
+                            elif isinstance(s, str):
+                                await _emit_reasoning(s)
+
+            # 3. Inline <think>…</think> blocks inside delta.content. Anthropic-shape
+            # and MiniMax both do this. We fire reasoning_delta for the inside of
+            # the tag and strip the entire block (including tags) from the visible
+            # reply. State carries across chunks because a tag may straddle deltas.
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                visible_parts: list[str] = []
+                buf = content
+                while buf:
+                    if in_think_block:
+                        end = buf.find("</think>")
+                        if end == -1:
+                            await _emit_reasoning(buf)
+                            buf = ""
+                        else:
+                            await _emit_reasoning(buf[:end])
+                            buf = buf[end + len("</think>"):]
+                            in_think_block = False
+                    else:
+                        start = buf.find("<think>")
+                        if start == -1:
+                            visible_parts.append(buf)
+                            buf = ""
+                        else:
+                            if start > 0:
+                                visible_parts.append(buf[:start])
+                            buf = buf[start + len("<think>"):]
+                            in_think_block = True
+                visible = "".join(visible_parts)
+                if visible:
+                    accumulated.append(visible)
+        except Exception:
+            return
+
+    try:
+        async with client.stream(
+            "POST",
+            completion_url,
+            headers={**headers, "Accept": "text/event-stream"},
+            json={"model": "hermes-agent", "messages": messages, "stream": True},
+        ) as response:
+            if response.status_code != 200:
+                err_body = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                return None, f"api_server returned {response.status_code}: {err_body}"
+            async for line in response.aiter_lines():
+                if line == "":
+                    await _flush()
+                    continue
+                if line.startswith(":"):
+                    continue  # SSE comment / keepalive
+                if line.startswith("event:"):
+                    pending_event = line[len("event:"):].strip()
+                    continue
+                if line.startswith("data:"):
+                    pending_data_lines.append(line[len("data:"):].lstrip())
+                    continue
+            await _flush()
+    except Exception as exc:
+        return None, f"api_server stream failed: {exc}"
+
+    text = "".join(accumulated).strip()
+    if not text:
+        return None, "api_server returned no assistant text"
+    return text, None
+
+
 async def _handle_user_message(config: dict[str, Any], row: dict[str, Any]) -> None:
     import httpx
 
@@ -414,69 +724,82 @@ async def _handle_user_message(config: dict[str, Any], row: dict[str, Any]) -> N
 
     api_port = int(os.environ.get("API_SERVER_PORT", "8642"))
     completion_url = f"http://127.0.0.1:{api_port}/v1/chat/completions"
+    # Defense-in-depth: when the gateway is configured with API_SERVER_KEY
+    # the api_server platform rejects unauthenticated /v1/* calls. The
+    # plugin runs in-process so it sees the same env. Without this header
+    # the plugin's loopback POST would 401 after Onepilot deploy generates
+    # a key.
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("API_SERVER_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Tell the iOS client we accepted the message and dispatched the agent.
+    # This is the first heartbeat — it lets the UI reset its no-reply timer
+    # and surface a "thinking" state with concrete provenance ("the plugin
+    # is alive and calling the model"), separate from optimistic local UI.
+    await _broadcast(config, session_id, "started", {})
+
+    # Live trail accumulator. Every reasoning_delta / tool_progress event
+    # appends to this string and we upsert it to `agent_session_progress`
+    # so iOS can recover the trail if the user closes the app mid-thought.
+    # Plain dict-as-mutable-cell because Python closures don't see nonlocal
+    # str rebinding without the keyword and a dict avoids that ceremony.
+    _trail = {"text": ""}
+    user_id_str = str(config.get("userId") or row.get("user_id") or "")
+    agent_id_str = str(config.get("agentProfileId") or row.get("agent_profile_id") or "")
+
+    async def _on_progress(event_kind: str, payload: dict[str, Any]) -> None:
+        await _broadcast(config, session_id, event_kind, payload)
+        # Build a trail line from whatever the event carries. reasoning_delta
+        # contributes the raw text; tool_progress contributes a one-line
+        # "<emoji> <label>" marker so the trail mirrors what the iOS bubble
+        # shows. Anything else is a no-op for trail purposes.
+        line = ""
+        if event_kind == "reasoning_delta":
+            t = payload.get("text") if isinstance(payload, dict) else None
+            if isinstance(t, str):
+                line = t
+        elif event_kind == "tool_progress" and isinstance(payload, dict):
+            emoji = payload.get("emoji") or "→"
+            label = payload.get("label") or payload.get("tool") or "tool"
+            line = f"{emoji} {label}\n"
+        if not line:
+            return
+        if not _trail["text"].endswith(line):
+            _trail["text"] += line
+            if user_id_str and agent_id_str:
+                await _progress_upsert(config, session_id, user_id_str, agent_id_str, _trail["text"])
+
+    reply: Optional[str] = None
+    error: Optional[str] = None
     try:
-        # No read timeout — agent runs can take many minutes.
+        # No read timeout — agent runs can take many minutes. Streaming keeps
+        # the loopback connection live so any idle timeout in the gateway
+        # never trips, and we forward progress to iOS as it arrives.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
         ) as client:
-            r = await client.post(
-                completion_url,
-                headers={"Content-Type": "application/json"},
-                json={"model": "hermes-agent", "messages": messages, "stream": False},
+            reply, error = await _stream_completion(
+                client, completion_url, headers, messages, _on_progress
             )
     except Exception as exc:
-        logger.warning("[onepilot] api_server call failed: %s", exc)
-        return
+        error = f"api_server call failed: {exc}"
 
-    if r.status_code != 200:
-        logger.warning("[onepilot] api_server %d: %s", r.status_code, r.text[:200])
+    if error:
+        logger.warning("[onepilot] %s", error)
+        # Surface the failure as a visible assistant row so the user sees
+        # WHY their request didn't produce a reply, instead of staring at a
+        # silent spinner until the iOS reply-timeout fires.
+        await _broadcast(config, session_id, "error", {"message": error})
+        await _post_assistant_row(config, row, f"⚠️ {error}")
+        await _progress_clear(config, session_id)
         return
+    assert reply is not None  # narrowed by error == None
 
-    try:
-        completion = r.json()
-    except Exception as exc:
-        logger.warning("[onepilot] api_server response parse failed: %s", exc)
-        return
-    reply = _extract_assistant_text(completion)
-    if not reply:
-        logger.warning("[onepilot] api_server returned no assistant text")
-        return
-
-    ingest_body = {
-        "userId": str(config["userId"]).lower(),
-        "agentProfileId": str(config["agentProfileId"]).lower(),
-        "sessionKey": row.get("session_key") or config["sessionKey"],
-        "role": "assistant",
-        "content": [{"type": "text", "text": reply}],
-        "timestamp": int(time.time() * 1000),
-    }
-    ingest_url = f"{config['backendUrl']}/functions/v1/agent-message-ingest"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {config['agentKey']}",
-    }
-    body_str = json.dumps(ingest_body)
-
-    delays = [0.25, 0.75]
-    last_status = None
-    for attempt in range(len(delays) + 1):
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.post(ingest_url, headers=headers, content=body_str)
-            last_status = r.status_code
-            if r.status_code < 500 or attempt == len(delays):
-                if r.status_code != 200:
-                    logger.warning("[onepilot] ingest %d: %s", r.status_code, r.text[:200])
-                else:
-                    logger.info("[onepilot] reply delivered (%d chars)", len(reply))
-                return
-            logger.warning("[onepilot] ingest %d (attempt %d) — retrying", r.status_code, attempt + 1)
-        except Exception as exc:
-            if attempt == len(delays):
-                logger.warning("[onepilot] ingest network error: %s", exc)
-                return
-            logger.warning("[onepilot] ingest network error (attempt %d): %s — retrying", attempt + 1, exc)
-        await asyncio.sleep(delays[attempt])
+    await _broadcast(config, session_id, "done", {})
+    await _post_assistant_row(config, row, reply)
+    await _progress_clear(config, session_id)
 
 
 async def _load_history(config: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
