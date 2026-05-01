@@ -204,6 +204,16 @@ async def _onepilot_deliver(
 
 
 async def _run(config: dict[str, Any]) -> None:
+    # Approvals forwarding loop runs in parallel with the main subscribe
+    # loop. Default OFF (gated on the ``onepilot-approvals.enabled`` flag
+    # file) so a vanilla install doesn't change agent behavior; flipped via
+    # ``approvals_cli.py enable`` from the iOS adapter.
+    try:
+        from approvals import approvals_loop  # type: ignore
+        asyncio.create_task(approvals_loop(config, _broadcast))
+    except Exception as exc:
+        logger.info("[onepilot] approvals loop unavailable (%s)", exc)
+
     backoff = 1.0
     while True:
         try:
