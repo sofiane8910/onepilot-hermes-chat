@@ -212,7 +212,7 @@ async def _run(config: dict[str, Any]) -> None:
         from approvals import approvals_loop  # type: ignore
         asyncio.create_task(approvals_loop(config, _broadcast))
     except Exception as exc:
-        logger.info("[onepilot] approvals loop unavailable (%s)", exc)
+        logger.warning("[onepilot] approvals loop unavailable (%s)", exc)
 
     backoff = 1.0
     while True:

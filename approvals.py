@@ -78,13 +78,23 @@ async def approvals_loop(config: dict[str, Any], broadcast_fn) -> None:
     ``broadcast_fn`` is ``_broadcast(config, session_id, event, payload)``
     from the main plugin module — passed in to avoid a circular import.
     """
-    try:
-        # Lazy import — only available in Hermes runtimes that ship mcp_serve.
-        # Older Hermes builds load the rest of the plugin fine; approvals
-        # forwarding just stays inert.
-        from hermes.mcp_serve import EventBridge  # type: ignore
-    except Exception as exc:
-        logger.info("[onepilot] approvals: EventBridge unavailable (%s) — feature inert", exc)
+    # mcp_serve lives at the top level in the editable hermes-agent install
+    # (`/.../hermes-agent/mcp_serve.py`). Some packaging variants surface it
+    # under `hermes.mcp_serve` instead. Try both before giving up.
+    EventBridge = None  # type: ignore[assignment]
+    last_exc: Exception | None = None
+    for modpath in ("mcp_serve", "hermes.mcp_serve"):
+        try:
+            mod = __import__(modpath, fromlist=["EventBridge"])
+            EventBridge = mod.EventBridge  # type: ignore[attr-defined]
+            break
+        except Exception as exc:
+            last_exc = exc
+    if EventBridge is None:
+        logger.warning(
+            "[onepilot] approvals: EventBridge unavailable (%s) — feature inert",
+            last_exc,
+        )
         return
 
     bridge = EventBridge()
