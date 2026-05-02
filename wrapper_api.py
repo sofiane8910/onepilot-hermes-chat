@@ -174,8 +174,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._handle_revoke(body)
             if self.path == "/onepilot/v1/plugin/uninstall":
                 return self._handle_uninstall()
-            if self.path == "/onepilot/v1/approvals/config":
-                return self._handle_approvals_config(body)
             self._send_json(404, {"ok": False, "error": "not found"})
         except json.JSONDecodeError as exc:
             self._send_json(400, {"ok": False, "error": f"invalid json: {exc}"})
@@ -292,17 +290,6 @@ class _Handler(BaseHTTPRequestHandler):
                 "error": f"uninstall rc={rc}: {(err or out)[:200]}",
             })
         self._send_json(200, {"ok": True})
-
-    def _handle_approvals_config(self, body: dict[str, Any]) -> None:
-        enabled = (body or {}).get("enabled")
-        if not isinstance(enabled, bool):
-            return self._send_json(400, {"ok": False, "error": "enabled (boolean) required"})
-        try:
-            from approvals import set_approvals_forwarding_enabled  # type: ignore
-            set_approvals_forwarding_enabled(enabled)
-            self._send_json(200, {"ok": True, "enabled": enabled})
-        except Exception as exc:
-            self._send_json(500, {"ok": False, "error": str(exc)})
 
 
 def start_wrapper_api(initial_config: dict[str, Any], gateway_port: int) -> Optional[ThreadingHTTPServer]:
